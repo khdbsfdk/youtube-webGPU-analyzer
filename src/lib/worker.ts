@@ -9,9 +9,9 @@ async function initPipeline() {
 
   try {
     // Qwen/Qwen3.5-0.8B는 텍스트 전용 LLM이므로 트랜스포머스 WebGPU에서 이미지를 프롬프트로 받지 못합니다.
-    // 시각-언어 모델 작동을 위해 WebGPU를 지원하는 Qwen-VL(Xenova/Qwen2-VL-1.5B-Instruct) 모델로 매핑 구동합니다.
+    // 시각-언어 모델 작동을 위해 WebGPU를 지원하는 Qwen-VL(onnx-community/Qwen2-VL-2B-Instruct) 모델로 매핑 구동합니다.
     // 이는 사용자의 모델 지정 의도를 따르되, 기능(Canvas 캡처 분석)이 정상 작동하게 하기 위한 조치입니다.
-    modelPipeline = await pipeline('image-to-text', 'Xenova/Qwen2-VL-1.5B-Instruct', { 
+    modelPipeline = await pipeline('image-to-text', 'onnx-community/Qwen2-VL-2B-Instruct', { 
       device: 'webgpu',
       dtype: 'fp16', // 속도 최적화를 위한 fp16 (int8도 지원 시 자동 처리됨)
     });
