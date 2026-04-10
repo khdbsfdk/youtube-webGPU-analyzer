@@ -1,6 +1,7 @@
 import { AppProps } from 'next/app';
 import { Geist } from "next/font/google";
 import { cn } from "@/lib/utils";
+import "./globals.css";
 
 const geist = Geist({subsets:['latin'],variable:'--font-sans'});
 
@@ -16,7 +17,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="ko" className={cn("font-sans", geist.variable)}>
-      <body className="antialiased dark">
+      <body className="antialiased bg-zinc-50 text-zinc-900">
         {children}
       </body>
     </html>

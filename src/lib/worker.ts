@@ -1,68 +1,143 @@
-import { pipeline, env } from '@huggingface/transformers';
+import {
+  AutoProcessor,
+  AutoModelForVision2Seq,
+  TextStreamer,
+  load_image,
+} from '@huggingface/transformers';
 
-env.allowLocalModels = false;
+const MODEL_ID = 'HuggingFaceTB/SmolVLM-256M-Instruct';
+const MAX_NEW_TOKENS = 512;
 
-let modelPipeline: any = null;
+// Singleton pattern for lazy loading
+class SmolVLM {
+  static processor: any = null;
+  static model: any = null;
 
-async function initPipeline() {
-  if (modelPipeline) return modelPipeline;
-
-  try {
-    // Qwen/Qwen3.5-0.8B는 텍스트 전용 LLM이므로 트랜스포머스 WebGPU에서 이미지를 프롬프트로 받지 못합니다.
-    // 시각-언어 모델 작동을 위해 WebGPU를 지원하는 Qwen-VL(onnx-community/Qwen2-VL-2B-Instruct) 모델로 매핑 구동합니다.
-    // 이는 사용자의 모델 지정 의도를 따르되, 기능(Canvas 캡처 분석)이 정상 작동하게 하기 위한 조치입니다.
-    modelPipeline = await pipeline('image-to-text', 'onnx-community/Qwen2-VL-2B-Instruct', { 
-      device: 'webgpu',
-      dtype: 'fp16', // 속도 최적화를 위한 fp16 (int8도 지원 시 자동 처리됨)
-    });
-    
-    self.postMessage({ status: 'ready' });
-    return modelPipeline;
-  } catch (error) {
-    console.error("Pipeline initialization failed:", error);
-    self.postMessage({ status: 'error', error: String(error) });
-    return null;
+  static async getInstance(progress_callback?: (x: any) => void) {
+    if (!this.processor) {
+      this.processor = AutoProcessor.from_pretrained(MODEL_ID, {
+        progress_callback,
+      });
+    }
+    if (!this.model) {
+      this.model = AutoModelForVision2Seq.from_pretrained(MODEL_ID, {
+        dtype: 'fp32',  // Use fp32 for broader WebGPU compatibility
+        device: 'webgpu',
+        progress_callback,
+      });
+    }
+    return Promise.all([this.processor, this.model]);
   }
 }
 
-initPipeline();
+// ─── Load model on startup ────────────────────────────────────────────────────
+async function loadModel() {
+  self.postMessage({ status: 'loading', message: '모델 로딩 중...' });
 
-self.addEventListener('message', async (event: MessageEvent) => {
-  const { type, image } = event.data;
-  
-  if (type === 'analyze') {
-    const pipe = await initPipeline();
-    if (!pipe) return;
-
-    try {
-      self.postMessage({ status: 'update', type: 'generation', output: '모델이 프레임을 로드하고 분석 중입니다...' });
-
-      // 자연스러운 한글 출력을 위한 프롬프트 적용
-      const prompt = "이 화면에서 무엇이 일어나고 있나요? 구체적이고 자연스러운 한글 문장으로 묘사해 주세요.";
-
-      const result = await pipe(image, {
-        prompt,
-        max_new_tokens: 150,
-        temperature: 0.7, // 좀 더 자연스러운 생성을 위해 추가
-      });
-
-      let outputText = "분석 결과를 생성하지 못했습니다.";
-      if (Array.isArray(result) && result.length > 0) {
-          outputText = result[0].generated_text || result[0].text || outputText;
-          // prompt 텍스트가 결과에 포함되었다면 제거
-          if (outputText.startsWith(prompt)) {
-              outputText = outputText.substring(prompt.length).trim();
-          }
+  try {
+    await SmolVLM.getInstance((progress: any) => {
+      if (progress.status === 'progress' || progress.status === 'downloading') {
+        self.postMessage({
+          status: 'progress',
+          file: progress.file,
+          progress: progress.progress,
+        });
       }
+    });
 
-      self.postMessage({ 
-        status: 'complete', 
-        output: outputText 
-      });
+    self.postMessage({ status: 'ready' });
+  } catch (err: any) {
+    console.error('Model load error:', err);
+    self.postMessage({ status: 'error', error: String(err) });
+  }
+}
 
-    } catch (e: any) {
-      console.error(e);
-      self.postMessage({ status: 'error', error: e.message });
-    }
+// Start loading immediately
+loadModel();
+
+// ─── Generate response ────────────────────────────────────────────────────────
+async function generate(imageDataUrl: string, promptText: string, maxTokens: number, temperature: number) {
+  try {
+    const [processor, model] = await SmolVLM.getInstance();
+
+    self.postMessage({ status: 'update', output: '이미지 로딩 중...' });
+
+    // Load image from data URL
+    const image = await load_image(imageDataUrl);
+
+    // Build messages
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'image' },
+          { type: 'text', text: promptText || '이 이미지를 자세히 분석해서 한국어로 설명해 주세요.' },
+        ],
+      },
+    ];
+
+    // Apply chat template
+    const text = processor.apply_chat_template(messages, {
+      add_generation_prompt: true,
+    });
+
+    // Preprocess inputs
+    const inputs = await processor(text, [image]);
+
+    self.postMessage({ status: 'update', output: 'WebGPU에서 AI 추론 중...' });
+
+    const startTime = performance.now();
+
+    // Collect streamed tokens
+    let outputText = '';
+    const callback_function = (output: string) => {
+      outputText += output;
+      self.postMessage({ status: 'update', output: outputText });
+    };
+
+    const streamer = new TextStreamer(processor.tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function,
+    });
+
+    const { sequences } = await model.generate({
+      ...inputs,
+      do_sample: false,
+      repetition_penalty: 1.1,
+      max_new_tokens: maxTokens || MAX_NEW_TOKENS,
+      streamer,
+      return_dict_in_generate: true,
+    });
+
+    const decoded = processor.batch_decode(sequences, { skip_special_tokens: true });
+    const endTime = performance.now();
+    const timeSec = ((endTime - startTime) / 1000).toFixed(1);
+
+    // The decoded output includes the prompt; extract only the assistant reply
+    const fullText = decoded[0] || outputText;
+    const assistantMarker = 'Assistant:';
+    const assistantIdx = fullText.lastIndexOf(assistantMarker);
+    const finalOutput = assistantIdx !== -1
+      ? fullText.substring(assistantIdx + assistantMarker.length).trim()
+      : (outputText || fullText).trim();
+
+    self.postMessage({
+      status: 'complete',
+      output: finalOutput,
+      time: timeSec,
+    });
+  } catch (e: any) {
+    console.error('Generation error:', e);
+    self.postMessage({ status: 'error', error: e.message || String(e) });
+  }
+}
+
+// ─── Message Handler ──────────────────────────────────────────────────────────
+self.addEventListener('message', async (event: MessageEvent) => {
+  const { type, image, prompt, maxTokens, temperature } = event.data;
+
+  if (type === 'analyze') {
+    generate(image, prompt, maxTokens, temperature);
   }
 });
